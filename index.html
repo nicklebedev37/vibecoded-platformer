@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Island Hopper</title>
+  <style>
+    :root {
+      --bg-top: #9cd6ff;
+      --bg-bottom: #c9ecff;
+      --water: #37a0e6;
+      --text: #0f2d44;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 20% 20%, rgba(255, 255, 255, 0.45), transparent 35%),
+        linear-gradient(180deg, var(--bg-top), var(--bg-bottom));
+      padding: 16px;
+    }
+
+    .wrap {
+      width: min(1300px, 100%);
+      display: grid;
+      gap: 10px;
+    }
+
+    .hud {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 0.95rem;
+      font-weight: 700;
+    }
+
+    .controls {
+      font-weight: 500;
+      font-size: 0.9rem;
+    }
+
+    canvas {
+      width: 100%;
+      height: auto;
+      aspect-ratio: 16 / 9;
+      border-radius: 14px;
+      border: 3px solid #ffffffcc;
+      box-shadow: 0 20px 30px rgba(20, 70, 110, 0.2);
+      background: linear-gradient(180deg, #7dd0ff 0%, #97dcff 45%, var(--water) 46%, #2a8fd0 100%);
+    }
+
+    .button-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: none;
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-weight: 700;
+      cursor: pointer;
+      background: #fff;
+      color: #0f2d44;
+      box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12);
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hud">
+      <div id="status">Reach the right island.</div>
+      <div class="controls">Move: A/D or ←/→, Jump: W/Space/↑</div>
+      <div class="button-row">
+        <button id="restart">Restart</button>
+      </div>
+    </div>
+    <canvas id="game" width="1280" height="720"></canvas>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const restartBtn = document.getElementById('restart');
+
+    const world = {
+      width: canvas.width,
+      height: canvas.height,
+      gravity: 1800,
+      waterline: 320,
+      deadlyWaterY: 566
+    };
+
+    const leftIsland = { x: 8, y: 560, w: 105, h: 160 };
+    const rightIsland = { x: world.width - 113, y: 560, w: 105, h: 160 };
+
+    const platformRows = [
+      { y: 470, count: 5 },
+      { y: 355, count: 5 }
+    ];
+
+    let platforms = [];
+
+    const player = {
+      w: 24,
+      h: 36,
+      x: leftIsland.x + 28,
+      y: leftIsland.y - 36,
+      vx: 0,
+      vy: 0,
+      speed: 250,
+      jump: 560,
+      onGround: false,
+      parentPlatform: null,
+      facing: 1
+    };
+
+    const input = { left: false, right: false, jumpQueued: false };
+
+    let gameState = 'playing';
+    let lastTs = 0;
+    let splashParticles = [];
+    let splashRipples = [];
+    let fireworkParticles = [];
+    let pendingFireworks = [];
+    let fireworkCooldown = 0;
+
+    function rand(min, max) {
+      return Math.random() * (max - min) + min;
+    }
+
+    function generatePlatforms() {
+      platforms = [];
+
+      platformRows.forEach((row, rowIndex) => {
+        const laneStart = leftIsland.x + leftIsland.w + 25;
+        const laneEnd = rightIsland.x - 25;
+        const laneWidth = laneEnd - laneStart;
+        const chunk = laneWidth / row.count;
+
+        for (let i = 0; i < row.count; i++) {
+          const w = rand(52, 82);
+          const minX = laneStart + i * chunk + 5;
+          const maxX = laneStart + (i + 1) * chunk - w - 5;
+          const baseX = Math.max(minX, Math.min(maxX, rand(minX, maxX)));
+          const speed = rand(65, 145) * (Math.random() < 0.5 ? 1 : -1);
+          const range = rand(28, Math.max(35, chunk * 0.45));
+
+          platforms.push({
+            x: baseX,
+            y: row.y,
+            w,
+            h: 14,
+            baseX,
+            phase: rand(0, Math.PI * 2),
+            speed,
+            range,
+            dir: rowIndex % 2 === 0 ? 1 : -1,
+            vx: 0
+          });
+        }
+      });
+    }
+
+    function resetPlayer() {
+      player.x = leftIsland.x + 28;
+      player.y = leftIsland.y - player.h;
+      player.vx = 0;
+      player.vy = 0;
+      player.onGround = false;
+      player.parentPlatform = null;
+      player.facing = 1;
+    }
+
+    function resetGame() {
+      gameState = 'playing';
+      generatePlatforms();
+      resetPlayer();
+      splashParticles = [];
+      splashRipples = [];
+      fireworkParticles = [];
+      pendingFireworks = [];
+      fireworkCooldown = 0;
+      statusEl.textContent = 'Reach the right island.';
+    }
+
+    function spawnSplash(x, y) {
+      for (let i = 0; i < 24; i++) {
+        const angle = rand(-Math.PI * 0.9, -Math.PI * 0.1);
+        const speed = rand(130, 360);
+        splashParticles.push({
+          x,
+          y,
+          vx: Math.cos(angle) * speed + rand(-25, 25),
+          vy: Math.sin(angle) * speed,
+          life: rand(0.45, 0.9),
+          maxLife: rand(0.45, 0.9),
+          size: rand(1.5, 3.8)
+        });
+      }
+
+      splashRipples.push(
+        { x, y: world.deadlyWaterY + 2, r: 10, life: 0.5, maxLife: 0.5, grow: 110 },
+        { x, y: world.deadlyWaterY + 2, r: 4, life: 0.65, maxLife: 0.65, grow: 85 }
+      );
+    }
+
+    function spawnFirework(x, y) {
+      const colors = ['#ffd166', '#ff6b6b', '#7ae582', '#7dd3ff', '#f7a6ff'];
+      const color = colors[Math.floor(rand(0, colors.length))];
+      const count = Math.floor(rand(30, 46));
+
+      for (let i = 0; i < count; i++) {
+        const angle = rand(0, Math.PI * 2);
+        const speed = rand(120, 300);
+        fireworkParticles.push({
+          x,
+          y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          life: rand(0.8, 1.35),
+          maxLife: rand(0.8, 1.35),
+          size: rand(1.6, 3.4),
+          color
+        });
+      }
+    }
+
+    function triggerWinFireworks() {
+      const centerX = rightIsland.x + rightIsland.w * 0.5;
+      const baseY = rightIsland.y - 120;
+      for (let i = 0; i < 5; i++) {
+        pendingFireworks.push({
+          delay: i * 0.18,
+          x: centerX + rand(-150, 150),
+          y: baseY + rand(-120, 20)
+        });
+      }
+      fireworkCooldown = 0.7;
+    }
+
+    function updatePlatforms(dt, time) {
+      for (const p of platforms) {
+        const prevX = p.x;
+        const oscillation = Math.sin(time * Math.abs(p.speed) / 170 + p.phase);
+        p.x = p.baseX + oscillation * p.range;
+
+        if (p.x < leftIsland.x + leftIsland.w + 10) {
+          p.x = leftIsland.x + leftIsland.w + 10;
+          p.phase += Math.PI * 0.5;
+        }
+
+        if (p.x + p.w > rightIsland.x - 10) {
+          p.x = rightIsland.x - 10 - p.w;
+          p.phase += Math.PI * 0.5;
+        }
+
+        p.vx = (p.x - prevX) / dt;
+      }
+    }
+
+    function intersectsTop(entity, surface) {
+      const feet = entity.y + entity.h;
+      const prevFeet = feet - entity.vy / 60;
+      const surfaceTop = surface.y;
+      const xOverlap = entity.x + entity.w > surface.x && entity.x < surface.x + surface.w;
+      return xOverlap && prevFeet <= surfaceTop + 8 && feet >= surfaceTop && entity.vy >= 0;
+    }
+
+    function updatePlayer(dt) {
+      if (input.left) {
+        player.vx = -player.speed;
+        player.facing = -1;
+      } else if (input.right) {
+        player.vx = player.speed;
+        player.facing = 1;
+      } else {
+        player.vx *= 0.82;
+        if (Math.abs(player.vx) < 5) player.vx = 0;
+      }
+
+      if (input.jumpQueued && player.onGround && gameState === 'playing') {
+        player.vy = -player.jump;
+        player.onGround = false;
+        player.parentPlatform = null;
+      }
+      input.jumpQueued = false;
+
+      player.vy += world.gravity * dt;
+      player.x += player.vx * dt;
+      player.y += player.vy * dt;
+
+      player.onGround = false;
+      player.parentPlatform = null;
+
+      const grounds = [
+        { x: leftIsland.x, y: leftIsland.y, w: leftIsland.w, h: leftIsland.h },
+        { x: rightIsland.x, y: rightIsland.y, w: rightIsland.w, h: rightIsland.h },
+        ...platforms
+      ];
+
+      for (const g of grounds) {
+        if (intersectsTop(player, g)) {
+          player.y = g.y - player.h;
+          player.vy = 0;
+          player.onGround = true;
+          if (platforms.includes(g)) {
+            player.parentPlatform = g;
+          }
+        }
+      }
+
+      if (player.parentPlatform) {
+        player.x += player.parentPlatform.vx * dt;
+      }
+
+      if (player.x < 0) player.x = 0;
+      if (player.x + player.w > world.width) player.x = world.width - player.w;
+
+      if (player.y > world.height + 30 || (player.y + player.h > world.deadlyWaterY && !player.onGround)) {
+        spawnSplash(player.x + player.w / 2, world.deadlyWaterY + 2);
+        gameState = 'sinking';
+        statusEl.textContent = 'You fell in the water.';
+      }
+
+      if (
+        player.x + player.w > rightIsland.x + 15 &&
+        player.x < rightIsland.x + rightIsland.w - 10 &&
+        player.y + player.h <= rightIsland.y + 2 &&
+        player.onGround
+      ) {
+        gameState = 'won';
+        statusEl.textContent = 'You made it to the right island!';
+        triggerWinFireworks();
+      }
+    }
+
+    function updateSinkingPlayer(dt) {
+      player.vy += world.gravity * 0.35 * dt;
+      player.vx *= 0.96;
+      player.x += player.vx * dt;
+      player.y += player.vy * dt;
+
+      if (player.x < 0) player.x = 0;
+      if (player.x + player.w > world.width) player.x = world.width - player.w;
+    }
+
+    function updateSplash(dt) {
+      for (const p of splashParticles) {
+        p.life -= dt;
+        p.vy += world.gravity * 0.55 * dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+      }
+      splashParticles = splashParticles.filter((p) => p.life > 0);
+
+      for (const r of splashRipples) {
+        r.life -= dt;
+        r.r += r.grow * dt;
+      }
+      splashRipples = splashRipples.filter((r) => r.life > 0);
+    }
+
+    function updateFireworks(dt) {
+      for (const fw of pendingFireworks) {
+        fw.delay -= dt;
+      }
+      const ready = pendingFireworks.filter((fw) => fw.delay <= 0);
+      pendingFireworks = pendingFireworks.filter((fw) => fw.delay > 0);
+      for (const fw of ready) {
+        spawnFirework(fw.x, fw.y);
+      }
+
+      if (gameState === 'won') {
+        fireworkCooldown -= dt;
+        if (fireworkCooldown <= 0) {
+          spawnFirework(rand(rightIsland.x - 170, rightIsland.x + rightIsland.w + 60), rand(120, rightIsland.y - 70));
+          fireworkCooldown = rand(0.55, 0.95);
+        }
+      }
+
+      for (const p of fireworkParticles) {
+        p.life -= dt;
+        p.vx *= 0.992;
+        p.vy += world.gravity * 0.28 * dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+      }
+      fireworkParticles = fireworkParticles.filter((p) => p.life > 0);
+    }
+
+    function drawIsland(island, side) {
+      ctx.save();
+      ctx.fillStyle = '#1f7f45';
+      ctx.beginPath();
+      ctx.ellipse(island.x + island.w / 2, island.y + 8, island.w / 2 + 6, 14, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#d7b775';
+      ctx.beginPath();
+      ctx.moveTo(island.x, island.y);
+      ctx.lineTo(island.x + island.w, island.y);
+      ctx.lineTo(island.x + island.w - 12, island.y + island.h);
+      ctx.lineTo(island.x + 12, island.y + island.h);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = '#59b564';
+      ctx.fillRect(island.x, island.y - 8, island.w, 8);
+
+      if (side === 'left') {
+        drawPalm(island.x + 35, island.y - 8, 0.9);
+      } else {
+        drawPalm(island.x + island.w - 40, island.y - 8, -0.9);
+      }
+      ctx.restore();
+    }
+
+    function drawPalm(x, y, bend) {
+      ctx.save();
+      ctx.translate(x, y);
+
+      ctx.strokeStyle = '#8b5a2b';
+      ctx.lineWidth = 7;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.quadraticCurveTo(12 * bend, -26, 8 * bend, -54);
+      ctx.stroke();
+
+      ctx.strokeStyle = '#2e8e43';
+      ctx.lineWidth = 4;
+      for (let i = -2; i <= 2; i++) {
+        ctx.beginPath();
+        ctx.moveTo(8 * bend, -54);
+        ctx.quadraticCurveTo(22 * bend + i * 7, -56 - Math.abs(i) * 2, 35 * bend + i * 3, -44 + i * 2);
+        ctx.stroke();
+      }
+
+      ctx.restore();
+    }
+
+    function drawPlatforms() {
+      for (const p of platforms) {
+        ctx.fillStyle = '#a66a35';
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+        ctx.fillStyle = '#c48846';
+        ctx.fillRect(p.x, p.y, p.w, 4);
+      }
+    }
+
+    function drawPlayer() {
+      const x = player.x;
+      const y = player.y;
+      ctx.save();
+      ctx.translate(x + player.w / 2, y + player.h / 2);
+      ctx.scale(player.facing, 1);
+      ctx.translate(-(x + player.w / 2), -(y + player.h / 2));
+
+      ctx.fillStyle = '#2b2b2b';
+      ctx.fillRect(x + 8, y + 10, 8, 16);
+      ctx.fillRect(x + 6, y + 26, 5, 10);
+      ctx.fillRect(x + 13, y + 26, 5, 10);
+      ctx.fillRect(x + 4, y + 14, 4, 10);
+      ctx.fillRect(x + 16, y + 14, 4, 10);
+
+      ctx.beginPath();
+      ctx.arc(x + 12, y + 7, 6, 0, Math.PI * 2);
+      ctx.fillStyle = '#f2c497';
+      ctx.fill();
+
+      ctx.fillStyle = '#1d1d1d';
+      ctx.fillRect(x + 8, y + 2, 8, 3);
+
+      ctx.restore();
+    }
+
+    function drawSkyDetails(time) {
+      ctx.save();
+      ctx.globalAlpha = 0.4;
+      ctx.fillStyle = '#ffffff';
+      for (let i = 0; i < 5; i++) {
+        const cx = (time * 15 + i * 220) % (world.width + 80) - 40;
+        const cy = 55 + i * 22;
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, 24, 10, 0, 0, Math.PI * 2);
+        ctx.ellipse(cx + 18, cy, 18, 8, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function drawSplash() {
+      if (!splashParticles.length && !splashRipples.length) return;
+
+      ctx.save();
+
+      for (const r of splashRipples) {
+        const a = Math.max(0, r.life / r.maxLife);
+        ctx.strokeStyle = `rgba(220, 246, 255, ${0.55 * a})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.ellipse(r.x, r.y, r.r, Math.max(2, r.r * 0.28), 0, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      for (const p of splashParticles) {
+        const a = Math.max(0, p.life / p.maxLife);
+        ctx.fillStyle = `rgba(232, 248, 255, ${0.85 * a})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+
+    function drawFireworks() {
+      if (!fireworkParticles.length) return;
+
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      for (const p of fireworkParticles) {
+        const alpha = Math.max(0, p.life / p.maxLife);
+        ctx.fillStyle = `${p.color}${Math.round(alpha * 255).toString(16).padStart(2, '0')}`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function draw(time) {
+      ctx.clearRect(0, 0, world.width, world.height);
+
+      drawSkyDetails(time);
+
+      ctx.fillStyle = '#2f98de';
+      ctx.fillRect(0, world.waterline, world.width, world.height - world.waterline);
+
+      drawIsland(leftIsland, 'left');
+      drawIsland(rightIsland, 'right');
+      drawPlatforms();
+      drawPlayer();
+      drawSplash();
+      drawFireworks();
+    }
+
+    function tick(ts) {
+      const dt = Math.min((ts - lastTs) / 1000, 0.03) || 0.016;
+      lastTs = ts;
+
+      const t = ts / 1000;
+
+      if (gameState === 'playing') {
+        updatePlatforms(dt, t);
+        updatePlayer(dt);
+      } else if (gameState === 'sinking') {
+        updatePlatforms(dt, t);
+        updateSinkingPlayer(dt);
+      } else if (gameState === 'won') {
+        updatePlatforms(dt, t);
+      }
+      updateSplash(dt);
+      updateFireworks(dt);
+
+      draw(t);
+      requestAnimationFrame(tick);
+    }
+
+    function onKey(e, down) {
+      const key = e.key.toLowerCase();
+      if (['arrowleft', 'arrowright', 'arrowup', ' ', 'a', 'd', 'w'].includes(key) || e.key === ' ') {
+        e.preventDefault();
+      }
+
+      if (key === 'a' || key === 'arrowleft') input.left = down;
+      if (key === 'd' || key === 'arrowright') input.right = down;
+      if ((key === 'w' || key === 'arrowup' || e.key === ' ') && down) {
+        input.jumpQueued = true;
+      }
+    }
+
+    window.addEventListener('keydown', (e) => onKey(e, true));
+    window.addEventListener('keyup', (e) => onKey(e, false));
+
+    restartBtn.addEventListener('click', resetGame);
+
+    resetGame();
+    requestAnimationFrame((ts) => {
+      lastTs = ts;
+      requestAnimationFrame(tick);
+    });
+  </script>
+</body>
+</html>
